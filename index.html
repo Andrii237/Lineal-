@@ -61,6 +61,7 @@ button.hl{background:#3b82f6;color:#fff}
       <button id="bRuler" class="on" title="Показать / скрыть линейку"><svg viewBox="0 0 24 24"><rect x="2" y="8" width="20" height="8" rx="1"/><path d="M6 8v3M10 8v4M14 8v3M18 8v4"/></svg><span class="txt">Линейка</span></button>
       <button id="bRot" title="Повернуть линейку на 90°"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-3-6.2"/><path d="M20 4v5h-5"/></svg>90°</button>
       <button id="bGrid" class="on" title="Сетка"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4zM4 10h16M4 15h16M10 4v16M15 4v16"/></svg></button>
+      <button id="bZoom" title="Масштаб: нажмите — весь лист / 100%">100%</button>
       <button id="bStylus" title="Рисовать только стилусом"><svg viewBox="0 0 24 24"><path d="M15 4l5 5L9 20H4v-5z"/></svg><span class="txt">Стилус</span></button>
     </div>
     <div class="sep"></div>
@@ -89,6 +90,7 @@ button.hl{background:#3b82f6;color:#fff}
       <h2>Как пользоваться</h2>
       <ul>
         <li><b>Линейка</b>: двигать одним пальцем, вращать двумя (второй палец ставьте где угодно). Возле 0°, 15°, 45°, 90° она прилипает.</li>
+        <li><b>Лист</b> в 5 раз больше экрана. Двигать его — двумя пальцами (в режиме «Стилус» — одним), щипок — приблизить или отдалить. Мини-карта в углу: нажмите на неё, чтобы перейти в нужное место. Кнопка с процентами — весь лист / 100%.</li>
         <li><b>Ровная линия</b>: ведите стилусом вдоль края линейки.</li>
         <li><b>Прямая</b>: от точки к точке, концы цепляются к другим линиям, угол прилипает к шагу 15°.</li>
         <li><b>Трюк</b>: в режиме «Перо» нарисуйте линию и задержите стилус, и она выпрямится.</li>
@@ -106,17 +108,21 @@ button.hl{background:#3b82f6;color:#fff}
 {
 const $=id=>document.getElementById(id);
 const cv=$('c'),ctx=cv.getContext('2d'),stage=$('stage');
-const CM=37.8,SNAP=30;
+const CM=37.8,SNAP=30,SHEET_K=5;
 const COLORS=[['#d62828','Фаза'],['#1d4ed8','Ноль'],['#15803d','Земля'],['#1f2328','Чёрный'],['#f59e0b','Оранжевый']];
 const WIDTHS=[2,4,7];
-let W=0,H=0,dpr=1;
+let W=0,H=0,dpr=1,SW=0,SH=0;
+const V={x:0,y:0,s:1};                       // вид: экран = (мир - V.xy) * V.s
 let items=[],undoS=[],redoS=[];
 let tool='pen',color=COLORS[0][0],width=WIDTHS[1],grid=true,rulerOn=true,penOnly=false;
-const R={x:0,y:0,a:0,raw:0,len:0,h:88};
-let cur=null,sel=null,drag=null,dirty=true;
-const rp=new Map();
+const R={x:0,y:0,a:0,raw:0,len:0,h:88};      // линейка лежит на экране, как настоящая
+let cur=null,sel=null,drag=null,dirty=true,miniId=null;
+const rp=new Map();                          // пальцы на линейке
+const pp=new Map();                          // пальцы, двигающие лист
 const imgCache=new Map();
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+const toWorld=p=>({x:p.x/V.s+V.x,y:p.y/V.s+V.y});
+const toScreen=p=>({x:(p.x-V.x)*V.s,y:(p.y-V.y)*V.s});
 
 /* ---------- хранение (IndexedDB) ---------- */
 let dbP=null;
@@ -124,19 +130,28 @@ function db(){if(!dbP)dbP=new Promise((res,rej)=>{try{const r=indexedDB.open('li
 async function kvSet(k,v){try{const d=await db();await new Promise((res,rej)=>{const t=d.transaction('kv','readwrite');t.objectStore('kv').put(v,k);t.oncomplete=res;t.onerror=()=>rej(t.error)})}catch(e){}}
 async function kvGet(k){try{const d=await db();return await new Promise((res,rej)=>{const r=d.transaction('kv').objectStore('kv').get(k);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}catch(e){return undefined}}
 let saveT,loaded=false;
-const saveNow=()=>{clearTimeout(saveT);if(loaded)kvSet('state',{items,R:{x:R.x,y:R.y,a:R.a},grid,penOnly,color,width})};
+const saveNow=()=>{clearTimeout(saveT);if(loaded)kvSet('state',{items,R:{x:R.x,y:R.y,a:R.a},grid,penOnly,color,width,sheet:{w:SW,h:SH},view:{...V}})};
 function persist(){clearTimeout(saveT);saveT=setTimeout(saveNow,250)}
 addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')saveNow()});
 addEventListener('pagehide',saveNow);
 
-/* ---------- размеры ---------- */
+/* ---------- размеры и вид ---------- */
 function resize(){
   const r=stage.getBoundingClientRect();W=r.width;H=r.height;dpr=window.devicePixelRatio||1;
   cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);
   R.len=Math.min(Math.max(W,H)*0.9,1400);
   R.x=Math.min(Math.max(R.x,40),W-40);R.y=Math.min(Math.max(R.y,40),H-40);
+  if(SW)clampView();
   dirty=true;placeSelbar();
 }
+const fitS=()=>Math.min(W/SW,H/SH)*0.95;
+function clampView(){
+  V.s=Math.min(4,Math.max(Math.min(1,fitS()),V.s));
+  const vw=W/V.s,vh=H/V.s,m=60/V.s;
+  V.x=vw>=SW+2*m?(SW-vw)/2:Math.min(Math.max(V.x,-m),SW-vw+m);
+  V.y=vh>=SH+2*m?(SH-vh)/2:Math.min(Math.max(V.y,-m),SH-vh+m);
+}
+function zoomAt(p,ns){const w=toWorld(p);V.s=ns;V.x=w.x-p.x/V.s;V.y=w.y-p.y/V.s;clampView();dirty=true;placeSelbar()}
 
 /* ---------- линейка ---------- */
 const toL=p=>{const c=Math.cos(R.a),s=Math.sin(R.a),dx=p.x-R.x,dy=p.y-R.y;return{x:dx*c+dy*s,y:-dx*s+dy*c}};
@@ -148,13 +163,14 @@ function rulerHit(p){
   return{inside:Math.abs(l.y)<=h2,edge:Math.abs(l.y+h2)<SNAP?-1:Math.abs(l.y-h2)<SNAP?1:0,l};
 }
 function snapAngle(a){const st=Math.PI/12,n=Math.round(a/st)*st;return Math.abs(a-n)<0.035?n:a}
+function rulerSeg(c){const ey=c.side*(R.h/2+c.width*V.s/2+.5);return[toWorld(toW(c.min,ey)),toWorld(toW(c.max,ey))]}
 
-/* ---------- привязки ---------- */
+/* ---------- привязки (мировые координаты) ---------- */
 const isImg=it=>it.kind==='img';
-function nearEnd(p,r=16){let best=null,bd=r;for(const s of items){if(isImg(s))continue;for(const e of [s.pts[0],s.pts[s.pts.length-1]]){const d=Math.hypot(e.x-p.x,e.y-p.y);if(d<bd){bd=d;best=e}}}return best}
+function nearEnd(p,r){let best=null,bd=r;for(const s of items){if(isImg(s))continue;for(const e of [s.pts[0],s.pts[s.pts.length-1]]){const d=Math.hypot(e.x-p.x,e.y-p.y);if(d<bd){bd=d;best=e}}}return best}
 function lineEnd(a,p){
-  const e=nearEnd(p);if(e&&(e.x!==a.x||e.y!==a.y))return{x:e.x,y:e.y};
-  const dx=p.x-a.x,dy=p.y-a.y,L=Math.hypot(dx,dy);if(L<1)return p;
+  const e=nearEnd(p,16/V.s);if(e&&(e.x!==a.x||e.y!==a.y))return{x:e.x,y:e.y};
+  const dx=p.x-a.x,dy=p.y-a.y,L=Math.hypot(dx,dy);if(L<1/V.s)return p;
   const ang=Math.atan2(dy,dx),st=Math.PI/12,n=Math.round(ang/st)*st,use=Math.abs(ang-n)<0.07?n:ang;
   return{x:a.x+Math.cos(use)*L,y:a.y+Math.sin(use)*L};
 }
@@ -174,68 +190,85 @@ async function addImage(blob){
     c.getContext('2d').drawImage(im,0,0,c.width,c.height);
     const png=blob.type==='image/png'&&c.width*c.height<1.5e6;
     const src=c.toDataURL(png?'image/png':'image/jpeg',.88);
-    const f=Math.min(1,(W*0.7)/c.width,(H*0.7)/c.height);
+    const vw=W/V.s,vh=H/V.s,f=Math.min(1/V.s,(vw*0.7)/c.width,(vh*0.7)/c.height);
     const w=c.width*f,h=c.height*f;
-    const it={kind:'img',id:uid(),src,x:(W-w)/2,y:(H-h)/2,w,h};
+    const it={kind:'img',id:uid(),src,x:V.x+(vw-w)/2,y:V.y+(vh-h)/2,w,h};
     commit([...items,it]);sel=it.id;tool='move';setBtns();placeSelbar();
     toast('Картинка вставлена — её можно двигать');
   }catch(e){toast('Не удалось открыть картинку')}
 }
-function imgAt(p){for(let i=items.length-1;i>=0;i--){const it=items[i];if(isImg(it)&&p.x>=it.x&&p.x<=it.x+it.w&&p.y>=it.y&&p.y<=it.y+it.h)return it}return null}
-function onHandle(p,it){return Math.hypot(p.x-(it.x+it.w),p.y-(it.y+it.h))<30}
+function imgAt(w){for(let i=items.length-1;i>=0;i--){const it=items[i];if(isImg(it)&&w.x>=it.x&&w.x<=it.x+it.w&&w.y>=it.y&&w.y<=it.y+it.h)return it}return null}
+function onHandle(w,it){return Math.hypot(w.x-(it.x+it.w),w.y-(it.y+it.h))<30/V.s}
 function placeSelbar(){
   const b=$('selbar'),it=sel&&items.find(i=>i.id===sel);
   if(!it||tool!=='move'){b.classList.remove('show');return}
   b.classList.add('show');
-  const bw=b.offsetWidth||260;
-  b.style.left=Math.max(6,Math.min(W-bw-6,it.x))+'px';
-  b.style.top=(it.y>56?it.y-50:Math.min(H-50,it.y+it.h+8))+'px';
+  const bw=b.offsetWidth||260,s=toScreen(it),h=it.h*V.s;
+  b.style.left=Math.max(6,Math.min(W-bw-6,s.x))+'px';
+  b.style.top=Math.max(6,Math.min(H-50,s.y>56?s.y-50:s.y+h+8))+'px';
 }
+
+/* ---------- мини-карта ---------- */
+function miniRect(){let mw=150,mh=mw*SH/SW;if(mh>110){mh=110;mw=mh*SW/SH}return{x:12,y:H-mh-12-(window.visualViewport?0:0),w:mw,h:mh,k:mw/SW}}
+function inMini(p){const m=miniRect();return p.x>=m.x-6&&p.x<=m.x+m.w+6&&p.y>=m.y-6&&p.y<=m.y+m.h+6}
+function jumpMini(p){const m=miniRect();const wx=(p.x-m.x)/m.k,wy=(p.y-m.y)/m.k;V.x=wx-W/V.s/2;V.y=wy-H/V.s/2;clampView();dirty=true;placeSelbar()}
 
 /* ---------- ввод ---------- */
 const pt=e=>{const r=cv.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top}};
 let stillTimer=null;
+function startPan(id,p){pp.set(id,p);try{cv.setPointerCapture(id)}catch(e){}}
 
 cv.addEventListener('pointerdown',e=>{
-  const p=pt(e),isFinger=e.pointerType!=='pen';
-  if(e.pointerType==='pen'&&!penOnly){penOnly=true;setBtns();toast('Стилус найден — пальцы теперь только двигают линейку');persist()}
-  // второй палец при жесте линейки — вращение
+  const p=pt(e),isTouch=e.pointerType==='touch',isFinger=e.pointerType!=='pen';
+  if(e.pointerType==='pen'&&!penOnly){penOnly=true;setBtns();toast('Стилус найден — пальцы теперь двигают лист и линейку');persist()}
+  if(!cur&&!drag&&!pp.size&&!rp.size&&inMini(p)){miniId=e.pointerId;cv.setPointerCapture(e.pointerId);jumpMini(p);return}
+  // второй палец при удержании линейки — вращение линейки
   if(isFinger&&rp.size===1&&!cur&&!drag){rp.set(e.pointerId,p);cv.setPointerCapture(e.pointerId);return}
+  // второй палец при движении листа — щипок
+  if(isTouch&&pp.size){startPan(e.pointerId,p);return}
+  // второй палец, пока первый рисует пальцем — отменяем штрих и двигаем лист
+  if(isTouch&&cur&&cur.touch){
+    const f=cur;cur=null;clearTimeout(stillTimer);if(f.erase&&f.removed)items=f.base;
+    startPan(f.id,f.lastS);startPan(e.pointerId,p);dirty=true;return;
+  }
+  if(isTouch&&drag&&drag.touch){items=drag.base;const d=drag;drag=null;startPan(d.id,d.lastS);startPan(e.pointerId,p);dirty=true;return}
   const hit=rulerHit(p);
   if(hit&&hit.inside&&isFinger&&!(e.pointerType==='mouse'&&Math.abs(hit.l.y)>R.h/2-12)){rp.set(e.pointerId,p);cv.setPointerCapture(e.pointerId);return}
   if(cur||drag)return;
-  // выбор картинок
+  if(e.pointerType==='mouse'&&(e.button===1||e.button===2)){startPan(e.pointerId,p);return}
+  const w=toWorld(p);
   if(tool==='move'){
     const s=sel&&items.find(i=>i.id===sel);
-    const it=(s&&onHandle(p,s))?s:imgAt(p);
-    if(!it){sel=null;placeSelbar();dirty=true;return}
+    const it=(s&&onHandle(w,s))?s:imgAt(w);
+    if(!it){sel=null;placeSelbar();dirty=true;if(isFinger)startPan(e.pointerId,p);return}
     sel=it.id;cv.setPointerCapture(e.pointerId);
-    drag={id:e.pointerId,mode:onHandle(p,it)?'size':'move',p0:p,o:{...it},base:items,moved:false};
+    drag={id:e.pointerId,touch:isTouch,mode:onHandle(w,it)?'size':'move',p0:p,lastS:p,o:{...it},base:items,moved:false};
     placeSelbar();dirty=true;return;
   }
-  if(penOnly&&e.pointerType==='touch')return;
+  if(penOnly&&isTouch){startPan(e.pointerId,p);return}
   cv.setPointerCapture(e.pointerId);
-  if(tool==='erase'){cur={id:e.pointerId,erase:true,removed:false,base:items};eraseAt(p);return}
+  if(tool==='erase'){cur={id:e.pointerId,touch:isTouch,lastS:p,erase:true,removed:false,base:items};eraseAt(w);return}
   if(hit&&(hit.edge||hit.inside)&&tool==='pen'){
     const side=hit.edge||(hit.l.y<0?-1:1);
-    cur={id:e.pointerId,mode:'ruler',side,min:hit.l.x,max:hit.l.x,color,width};dirty=true;return;
+    cur={id:e.pointerId,touch:isTouch,lastS:p,mode:'ruler',side,min:hit.l.x,max:hit.l.x,color,width};dirty=true;return;
   }
-  if(tool==='line'){const e2=nearEnd(p),a=e2?{x:e2.x,y:e2.y}:p;cur={id:e.pointerId,mode:'line',a,b:a,color,width};dirty=true;return}
-  cur={id:e.pointerId,mode:'free',pts:[p],color,width,last:p};armStill(p);dirty=true;
+  if(tool==='line'){const e2=nearEnd(w,16/V.s),a=e2?{x:e2.x,y:e2.y}:w;cur={id:e.pointerId,touch:isTouch,lastS:p,mode:'line',a,b:a,color,width};dirty=true;return}
+  cur={id:e.pointerId,touch:isTouch,lastS:p,mode:'free',pts:[w],color,width,last:w};armStill(w);dirty=true;
 });
 
-function armStill(p){
+function armStill(w){
   clearTimeout(stillTimer);
   stillTimer=setTimeout(()=>{
     if(cur&&cur.mode==='free'&&cur.pts.length>4){
       const a=cur.pts[0];
-      if(Math.hypot(p.x-a.x,p.y-a.y)>30){const sa=nearEnd(a);const A=sa?{x:sa.x,y:sa.y}:a;cur={id:cur.id,mode:'line',a:A,b:lineEnd(A,p),color:cur.color,width:cur.width};dirty=true;toast('Выпрямлено')}
+      if(Math.hypot(w.x-a.x,w.y-a.y)*V.s>30){const sa=nearEnd(a,16/V.s);const A=sa?{x:sa.x,y:sa.y}:a;cur={id:cur.id,touch:cur.touch,lastS:cur.lastS,mode:'line',a:A,b:lineEnd(A,w),color:cur.color,width:cur.width};dirty=true;toast('Выпрямлено')}
     }
   },550);
 }
 
 cv.addEventListener('pointermove',e=>{
   const p=pt(e);
+  if(miniId===e.pointerId){jumpMini(p);return}
   if(rp.has(e.pointerId)){
     if(rp.size===1){const o=rp.get(e.pointerId);R.x+=p.x-o.x;R.y+=p.y-o.y}
     else{
@@ -249,54 +282,87 @@ cv.addEventListener('pointermove',e=>{
     }
     rp.set(e.pointerId,p);dirty=true;return;
   }
+  if(pp.has(e.pointerId)){
+    const prev=new Map(pp);pp.set(e.pointerId,p);
+    if(pp.size===1){const o=prev.get(e.pointerId);V.x-=(p.x-o.x)/V.s;V.y-=(p.y-o.y)/V.s}
+    else{
+      const [a,b]=[...pp.keys()];
+      const a0=prev.get(a),b0=prev.get(b),a1=pp.get(a),b1=pp.get(b);
+      const m0={x:(a0.x+b0.x)/2,y:(a0.y+b0.y)/2},m1={x:(a1.x+b1.x)/2,y:(a1.y+b1.y)/2};
+      const d0=Math.hypot(a0.x-b0.x,a0.y-b0.y)||1,d1=Math.hypot(a1.x-b1.x,a1.y-b1.y)||1;
+      const wm=toWorld(m0);
+      V.s=Math.min(4,Math.max(Math.min(1,fitS()),V.s*d1/d0));
+      V.x=wm.x-m1.x/V.s;V.y=wm.y-m1.y/V.s;
+    }
+    clampView();placeSelbar();dirty=true;return;
+  }
   if(drag&&drag.id===e.pointerId){
-    const dx=p.x-drag.p0.x,dy=p.y-drag.p0.y,o=drag.o;let n;
+    drag.lastS=p;
+    const dx=(p.x-drag.p0.x)/V.s,dy=(p.y-drag.p0.y)/V.s,o=drag.o;let n;
     if(drag.mode==='move')n={...o,x:o.x+dx,y:o.y+dy};
-    else{const k=Math.max(30/o.w,(o.w+dx)/o.w);n={...o,w:o.w*k,h:o.h*k}}
+    else{const k=Math.max(30/V.s/o.w,(o.w+dx)/o.w);n={...o,w:o.w*k,h:o.h*k}}
     drag.moved=true;items=drag.base.map(i=>i.id===o.id?n:i);placeSelbar();dirty=true;return;
   }
   if(!cur||cur.id!==e.pointerId)return;
+  cur.lastS=p;
   const evs=e.getCoalescedEvents?e.getCoalescedEvents():[e];
-  if(cur.erase){for(const ev of evs)eraseAt(pt(ev));return}
+  if(cur.erase){for(const ev of evs)eraseAt(toWorld(pt(ev)));return}
   if(cur.mode==='ruler'){for(const ev of evs){const l=toL(pt(ev));cur.min=Math.min(cur.min,l.x);cur.max=Math.max(cur.max,l.x)}}
-  else if(cur.mode==='line')cur.b=lineEnd(cur.a,p);
-  else{for(const ev of evs){const q=pt(ev);if(Math.hypot(q.x-cur.last.x,q.y-cur.last.y)>1.2){cur.pts.push(q);cur.last=q}}
-    if(!cur.sp||Math.hypot(p.x-cur.sp.x,p.y-cur.sp.y)>5){cur.sp=p;armStill(p)}}
+  else if(cur.mode==='line')cur.b=lineEnd(cur.a,toWorld(p));
+  else{
+    const minD=1.2/V.s;
+    for(const ev of evs){const q=toWorld(pt(ev));if(Math.hypot(q.x-cur.last.x,q.y-cur.last.y)>minD){cur.pts.push(q);cur.last=q}}
+    if(!cur.sp||Math.hypot(p.x-cur.sp.x,p.y-cur.sp.y)>5){cur.sp=p;armStill(toWorld(p))}
+  }
   dirty=true;
 });
 
 function endPointer(e){
+  if(miniId===e.pointerId){miniId=null;persist();return}
   if(rp.has(e.pointerId)){rp.delete(e.pointerId);if(!rp.size){R.raw=R.a;persist()}return}
+  if(pp.has(e.pointerId)){pp.delete(e.pointerId);if(!pp.size)persist();return}
   if(drag&&drag.id===e.pointerId){const d=drag;drag=null;if(d.moved){undoS.push(d.base);redoS=[];afterChange()}return}
   if(!cur||cur.id!==e.pointerId)return;
   clearTimeout(stillTimer);
   const c=cur;cur=null;dirty=true;
   if(c.erase){if(c.removed){undoS.push(c.base);redoS=[];afterChange()}return}
   let s;
-  if(c.mode==='ruler'){if(c.max-c.min<3)return;const ey=c.side*(R.h/2+c.width/2+.5);s={pts:[toW(c.min,ey),toW(c.max,ey)]}}
-  else if(c.mode==='line'){if(Math.hypot(c.b.x-c.a.x,c.b.y-c.a.y)<3)return;s={pts:[c.a,c.b]}}
+  if(c.mode==='ruler'){if(c.max-c.min<3)return;s={pts:rulerSeg(c)}}
+  else if(c.mode==='line'){if(Math.hypot(c.b.x-c.a.x,c.b.y-c.a.y)*V.s<3)return;s={pts:[c.a,c.b]}}
   else{if(c.pts.length===1)c.pts.push({x:c.pts[0].x+.1,y:c.pts[0].y});s={pts:c.pts.map(q=>({x:+q.x.toFixed(1),y:+q.y.toFixed(1)}))}}
   s.color=c.color;s.width=c.width;
   commit([...items,s]);
 }
 cv.addEventListener('pointerup',endPointer);
-cv.addEventListener('pointercancel',e=>{if(cur&&cur.id===e.pointerId){cur=null;dirty=true}if(drag&&drag.id===e.pointerId){items=drag.base;drag=null;dirty=true}rp.delete(e.pointerId)});
-cv.addEventListener('wheel',e=>{const h=rulerHit(pt(e));if(!h||!h.inside)return;e.preventDefault();const st=e.shiftKey?Math.PI/12:Math.PI/180;R.a=R.raw=Math.round((R.a+Math.sign(e.deltaY)*st)/st)*st;dirty=true;persist()},{passive:false});
+cv.addEventListener('pointercancel',e=>{
+  if(cur&&cur.id===e.pointerId){if(cur.erase&&cur.removed)items=cur.base;cur=null;dirty=true}
+  if(drag&&drag.id===e.pointerId){items=drag.base;drag=null;dirty=true}
+  rp.delete(e.pointerId);pp.delete(e.pointerId);if(miniId===e.pointerId)miniId=null;
+});
+cv.addEventListener('wheel',e=>{
+  e.preventDefault();const p=pt(e),h=rulerHit(p);
+  if(h&&h.inside&&!e.ctrlKey){const st=e.shiftKey?Math.PI/12:Math.PI/180;R.a=R.raw=Math.round((R.a+Math.sign(e.deltaY)*st)/st)*st;dirty=true;persist();return}
+  if(e.ctrlKey)zoomAt(p,Math.min(4,Math.max(Math.min(1,fitS()),V.s*Math.exp(-e.deltaY*0.01))));
+  else{V.x+=e.deltaX/V.s;V.y+=e.deltaY/V.s;clampView();dirty=true;placeSelbar()}
+  persist();
+},{passive:false});
 
 function segDist(p,a,b){const dx=b.x-a.x,dy=b.y-a.y,L=dx*dx+dy*dy;let t=L?((p.x-a.x)*dx+(p.y-a.y)*dy)/L:0;t=Math.max(0,Math.min(1,t));return Math.hypot(p.x-a.x-t*dx,p.y-a.y-t*dy)}
-function eraseAt(p){
-  const keep=items.filter(s=>{if(isImg(s))return true;const q=s.pts;for(let i=0;i<q.length-1;i++)if(segDist(p,q[i],q[i+1])<14+s.width/2)return false;return true});
+function eraseAt(w){
+  const r=14/V.s;
+  const keep=items.filter(s=>{if(isImg(s))return true;const q=s.pts;for(let i=0;i<q.length-1;i++)if(segDist(w,q[i],q[i+1])<r+s.width/2)return false;return true});
   if(keep.length!==items.length){items=keep;cur.removed=true}
-  cur.ep=p;dirty=true;
+  cur.ep=w;dirty=true;
 }
 
 /* ---------- отрисовка ---------- */
-function drawGrid(c,x0,y0,w,h){
-  c.lineWidth=1;
+function drawGrid(c,x0,y0,w,h,lw,sc){
+  c.lineWidth=lw;
   for(const [st,col] of [[20,'rgba(30,60,110,.07)'],[100,'rgba(30,60,110,.16)']]){
+    if(st*sc<6)continue;
     c.strokeStyle=col;c.beginPath();
-    for(let x=Math.floor(x0/st)*st;x<=x0+w;x+=st){c.moveTo(x+.5,y0);c.lineTo(x+.5,y0+h)}
-    for(let y=Math.floor(y0/st)*st;y<=y0+h;y+=st){c.moveTo(x0,y+.5);c.lineTo(x0+w,y+.5)}
+    for(let x=Math.ceil(x0/st)*st;x<=x0+w;x+=st){c.moveTo(x,y0);c.lineTo(x,y0+h)}
+    for(let y=Math.ceil(y0/st)*st;y<=y0+h;y+=st){c.moveTo(x0,y);c.lineTo(x0+w,y)}
     c.stroke();
   }
 }
@@ -320,12 +386,18 @@ function drawRuler(){
   ctx.fillStyle='rgba(255,214,64,.42)';ctx.beginPath();ctx.roundRect(-L,-h2,R.len,R.h,6);ctx.fill();
   ctx.shadowColor='transparent';ctx.strokeStyle='rgba(120,90,0,.55)';ctx.lineWidth=1;ctx.stroke();
   ctx.fillStyle='rgba(255,255,255,.28)';ctx.fillRect(-L+6,-h2+3,R.len-12,6);
+  // деления в сантиметрах листа (учитывают масштаб)
   ctx.strokeStyle='rgba(40,30,0,.75)';ctx.fillStyle='rgba(40,30,0,.8)';ctx.font='10px system-ui,sans-serif';ctx.textAlign='center';ctx.textBaseline='top';
-  const mm=CM/10,n=Math.floor(R.len/mm);
+  const cm=CM*V.s,mm=cm/10,showMm=mm>=3,unit=showMm?mm:cm,n=Math.floor(R.len/unit);
+  const lblEvery=[1,2,5,10,20,50,100].find(k=>cm*k>=28)||100;
   ctx.beginPath();
-  for(let i=0;i<=n;i++){const x=-L+i*mm,t=i%10===0?16:i%5===0?10:5;ctx.moveTo(x,-h2);ctx.lineTo(x,-h2+t);ctx.moveTo(x,h2);ctx.lineTo(x,h2-t)}
+  for(let i=0;i<=n;i++){
+    const isCm=showMm?i%10===0:true,cmIdx=showMm?i/10:i;
+    const t=isCm?(cmIdx%5===0?16:11):(i%5===0?9:5);
+    const x=-L+i*unit;ctx.moveTo(x,-h2);ctx.lineTo(x,-h2+t);ctx.moveTo(x,h2);ctx.lineTo(x,h2-t);
+  }
   ctx.stroke();
-  for(let i=10;i<n;i+=10)ctx.fillText(i/10,-L+i*mm,-h2+18);
+  for(let k=lblEvery;k*cm<R.len-6;k+=lblEvery)ctx.fillText(k,-L+k*cm,-h2+18);
   let deg=((-R.a*180/Math.PI)%360+360)%360;if(deg>180)deg-=360;
   const sh=Math.abs(Math.round(deg*10)/10);
   ctx.font='600 15px system-ui,sans-serif';ctx.textBaseline='middle';ctx.fillStyle='rgba(40,30,0,.85)';
@@ -333,27 +405,47 @@ function drawRuler(){
   if(cur&&cur.mode==='ruler'){ctx.strokeStyle=cur.color;ctx.lineWidth=2;ctx.globalAlpha=.35;ctx.beginPath();ctx.moveTo(-L,cur.side*h2);ctx.lineTo(L,cur.side*h2);ctx.stroke()}
   ctx.restore();
 }
+function drawMini(){
+  const m=miniRect();
+  ctx.save();
+  ctx.fillStyle='rgba(255,255,255,.92)';ctx.strokeStyle='rgba(31,35,40,.55)';ctx.lineWidth=1;
+  ctx.shadowColor='rgba(0,0,0,.2)';ctx.shadowBlur=8;ctx.fillRect(m.x,m.y,m.w,m.h);ctx.shadowColor='transparent';ctx.strokeRect(m.x+.5,m.y+.5,m.w-1,m.h-1);
+  ctx.beginPath();ctx.rect(m.x,m.y,m.w,m.h);ctx.clip();
+  ctx.translate(m.x,m.y);ctx.scale(m.k,m.k);
+  for(const it of items){if(isImg(it)){ctx.fillStyle='rgba(100,110,120,.35)';ctx.fillRect(it.x,it.y,it.w,it.h)}else{const w=it.width;it.width=Math.max(w,1.5/m.k);path(ctx,it);it.width=w}}
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.strokeStyle='#3b82f6';ctx.lineWidth=2;ctx.fillStyle='rgba(59,130,246,.12)';
+  const vx=m.x+V.x*m.k,vy=m.y+V.y*m.k,vw=W/V.s*m.k,vh=H/V.s*m.k;
+  ctx.fillRect(vx,vy,vw,vh);ctx.strokeRect(vx,vy,vw,vh);
+  ctx.restore();
+}
+let lastZoomTxt='';
 function render(){
-  if(dirty){
+  if(dirty&&SW){
     dirty=false;
     ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);
-    if(grid)drawGrid(ctx,0,0,W,H);
+    ctx.fillStyle='#cfd3d9';ctx.fillRect(0,0,W,H);
+    ctx.setTransform(dpr*V.s,0,0,dpr*V.s,-V.x*V.s*dpr,-V.y*V.s*dpr);
+    ctx.save();ctx.shadowColor='rgba(0,0,0,.18)';ctx.shadowBlur=12;ctx.fillStyle='#fff';ctx.fillRect(0,0,SW,SH);ctx.restore();
+    if(grid){const x0=Math.max(0,V.x),y0=Math.max(0,V.y),x1=Math.min(SW,V.x+W/V.s),y1=Math.min(SH,V.y+H/V.s);if(x1>x0&&y1>y0)drawGrid(ctx,x0,y0,x1-x0,y1-y0,1/V.s,V.s)}
     drawItems(ctx);
     let info=null;
     if(cur&&!cur.erase){
       let s;
-      if(cur.mode==='ruler'){const ey=cur.side*(R.h/2+cur.width/2+.5),a=toW(cur.min,ey),b=toW(cur.max,ey);s={pts:[a,b],color:cur.color,width:cur.width};info={t:((cur.max-cur.min)/CM).toFixed(1)+' см',p:{x:(a.x+b.x)/2,y:(a.y+b.y)/2}}}
-      else if(cur.mode==='line'){s={pts:[cur.a,cur.b],color:cur.color,width:cur.width};const d=Math.hypot(cur.b.x-cur.a.x,cur.b.y-cur.a.y);info={t:(d/CM).toFixed(1)+' см · '+Math.round(-Math.atan2(cur.b.y-cur.a.y,cur.b.x-cur.a.x)*180/Math.PI)+'°',p:cur.b}}
+      if(cur.mode==='ruler'){const [a,b]=rulerSeg(cur);s={pts:[a,b],color:cur.color,width:cur.width};info={t:((cur.max-cur.min)/V.s/CM).toFixed(1)+' см',p:toScreen({x:(a.x+b.x)/2,y:(a.y+b.y)/2})}}
+      else if(cur.mode==='line'){s={pts:[cur.a,cur.b],color:cur.color,width:cur.width};const d=Math.hypot(cur.b.x-cur.a.x,cur.b.y-cur.a.y);info={t:(d/CM).toFixed(1)+' см · '+Math.round(-Math.atan2(cur.b.y-cur.a.y,cur.b.x-cur.a.x)*180/Math.PI)+'°',p:toScreen(cur.b)}}
       else s=cur;
       path(ctx,s);
-      if(cur.mode==='line'){ctx.fillStyle=cur.color;for(const q of [cur.a,cur.b]){ctx.beginPath();ctx.arc(q.x,q.y,4,0,7);ctx.fill()}}
+      if(cur.mode==='line'){ctx.fillStyle=cur.color;for(const q of [cur.a,cur.b]){ctx.beginPath();ctx.arc(q.x,q.y,4/V.s,0,7);ctx.fill()}}
     }
-    if(cur&&cur.erase&&cur.ep){ctx.strokeStyle='rgba(0,0,0,.5)';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(cur.ep.x,cur.ep.y,14,0,7);ctx.stroke()}
+    if(cur&&cur.erase&&cur.ep){ctx.strokeStyle='rgba(0,0,0,.5)';ctx.lineWidth=1.5/V.s;ctx.beginPath();ctx.arc(cur.ep.x,cur.ep.y,14/V.s,0,7);ctx.stroke()}
     const s=tool==='move'&&sel&&items.find(i=>i.id===sel);
-    if(s){ctx.strokeStyle='#3b82f6';ctx.lineWidth=2;ctx.setLineDash([6,4]);ctx.strokeRect(s.x,s.y,s.w,s.h);ctx.setLineDash([]);ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(s.x+s.w,s.y+s.h,11,0,7);ctx.fill();ctx.stroke()}
+    if(s){ctx.strokeStyle='#3b82f6';ctx.lineWidth=2/V.s;ctx.setLineDash([6/V.s,4/V.s]);ctx.strokeRect(s.x,s.y,s.w,s.h);ctx.setLineDash([]);ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(s.x+s.w,s.y+s.h,11/V.s,0,7);ctx.fill();ctx.stroke()}
+    ctx.setTransform(dpr,0,0,dpr,0,0);
     if(rulerOn)drawRuler();
+    drawMini();
     if(info)label(info.t,info.p.x,info.p.y-26);
+    const zt=Math.round(V.s*100)+'%';if(zt!==lastZoomTxt){lastZoomTxt=zt;$('bZoom').textContent=zt}
   }
   requestAnimationFrame(render);
 }
@@ -370,11 +462,13 @@ function bounds(){
 }
 function exportBlob(){
   return new Promise(res=>{
-    const b=bounds()||{x:0,y:0,w:W,h:H},k=2,c=document.createElement('canvas');
-    c.width=Math.round(b.w*k);c.height=Math.round(b.h*k);
+    const b=bounds()||{x:V.x,y:V.y,w:W/V.s,h:H/V.s};
+    const k=Math.min(2,Math.sqrt(16e6/(b.w*b.h)));   // не больше ~16 Мпикс
+    const c=document.createElement('canvas');
+    c.width=Math.max(1,Math.round(b.w*k));c.height=Math.max(1,Math.round(b.h*k));
     const x=c.getContext('2d');x.scale(k,k);x.translate(-b.x,-b.y);
     x.fillStyle='#fff';x.fillRect(b.x,b.y,b.w,b.h);
-    if(grid)drawGrid(x,b.x,b.y,b.w,b.h);
+    if(grid)drawGrid(x,b.x,b.y,b.w,b.h,1,k);
     drawItems(x);c.toBlob(res,'image/png');
   });
 }
@@ -400,7 +494,8 @@ $('tMove').onclick=()=>{tool='move';setBtns();if(!items.some(isImg))toast('Зд�
 $('bRuler').onclick=()=>{rulerOn=!rulerOn;setBtns()};
 $('bRot').onclick=()=>{rulerOn=true;let a=Math.round((R.a-Math.PI/2)/(Math.PI/2))*(Math.PI/2);if(Math.abs(a)>=Math.PI*1.99)a=0;R.a=R.raw=a;R.x=Math.min(Math.max(R.x,60),W-60);R.y=Math.min(Math.max(R.y,60),H-60);setBtns();persist()};
 $('bGrid').onclick=()=>{grid=!grid;setBtns();persist()};
-$('bStylus').onclick=()=>{penOnly=!penOnly;setBtns();persist();toast(penOnly?'Рисует только стилус':'Рисуют и пальцы, и стилус')};
+$('bZoom').onclick=()=>{const c={x:W/2,y:H/2};if(Math.abs(V.s-1)<0.01){zoomAt(c,fitS())}else{zoomAt(c,1)}persist()};
+$('bStylus').onclick=()=>{penOnly=!penOnly;setBtns();persist();toast(penOnly?'Рисует только стилус, пальцы двигают лист':'Рисуют и пальцы, и стилус; лист — двумя пальцами',2600)};
 $('bUndo').onclick=()=>{if(!undoS.length)return;redoS.push(items);items=undoS.pop();afterChange()};
 $('bRedo').onclick=()=>{if(!redoS.length)return;undoS.push(items);items=redoS.pop();afterChange()};
 let clearArm=0;
@@ -411,7 +506,7 @@ $('sDone').onclick=()=>{sel=null;tool='pen';setBtns()};
 
 // вставка
 $('bPaste').onclick=async()=>{
-  if(!navigator.clipboard||!navigator.clipboard.read){toast('Нажмите и удерживайте на листе → «Вставить», или Ctrl+V',3000);return}
+  if(!navigator.clipboard||!navigator.clipboard.read){toast('Вставьте через Ctrl+V или кнопку «Галерея»',3000);return}
   try{
     const list=await navigator.clipboard.read();
     for(const ci of list){const t=ci.types.find(t=>t.startsWith('image/'));if(t){addImage(await ci.getType(t));return}}
@@ -450,13 +545,13 @@ $('bInstall').onclick=async()=>{if(!installEvt)return;installEvt.prompt();await 
 addEventListener('appinstalled',()=>{$('bInstall').style.display='none';toast('Приложение установлено')});
 
 $('bHelp').onclick=()=>$('help').classList.add('show');
-$('hClose').onclick=()=>{$('help').classList.remove('show');kvSet('helpSeen',1)};
+$('hClose').onclick=()=>{$('help').classList.remove('show');kvSet('helpSeen',2)};
 document.addEventListener('keydown',e=>{
   if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();(e.shiftKey?$('bRedo'):$('bUndo')).onclick()}
   if((e.key==='Delete'||e.key==='Backspace')&&sel&&tool==='move')$('sDel').onclick();
 });
 document.addEventListener('gesturestart',e=>e.preventDefault());
-document.addEventListener('contextmenu',e=>{if(e.target===cv&&!(e.pointerType==='touch'))e.preventDefault()});
+document.addEventListener('contextmenu',e=>{if(e.target===cv)e.preventDefault()});
 
 /* ---------- старт ---------- */
 new ResizeObserver(resize).observe(stage);
@@ -464,10 +559,13 @@ resize();
 (async()=>{
   const d=await kvGet('state');
   if(d){items=d.items||[];if(d.R){R.x=d.R.x;R.y=d.R.y;R.a=R.raw=d.R.a}grid=d.grid!==false;penOnly=!!d.penOnly;if(d.color)color=d.color;if(d.width)width=d.width}
-  else{R.x=W/2;R.y=H/2}
-  loaded=true;resize();setBtns();$('bUndo').disabled=true;$('bRedo').disabled=true;dirty=true;
-  if(!(await kvGet('helpSeen')))$('help').classList.add('show');
-  // картинка, присланная через «Поделиться»
+  if(d&&d.sheet){SW=d.sheet.w;SH=d.sheet.h}else{SW=Math.round(Math.max(W,H)*SHEET_K);SH=Math.round(Math.min(W,H)*SHEET_K)}
+  if(d&&d.view){Object.assign(V,d.view)}
+  else if(d&&d.items&&d.items.length){V.x=0;V.y=0;V.s=1}          // старые рисунки остаются в левом верхнем углу
+  else{V.s=1;V.x=(SW-W)/2;V.y=(SH-H)/2}
+  if(!d){R.x=W/2;R.y=H/2}
+  loaded=true;resize();clampView();setBtns();$('bUndo').disabled=true;$('bRedo').disabled=true;dirty=true;
+  if((await kvGet('helpSeen'))!==2)$('help').classList.add('show');
   if(location.search.includes('shared')){
     try{const c=await caches.open('lineal-shared'),r=await c.match('shared-image');if(r){await addImage(await r.blob());await c.delete('shared-image')}}catch(e){}
     history.replaceState(null,'','./');

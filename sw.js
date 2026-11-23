@@ -1,4 +1,4 @@
-const CACHE = 'lineal-v2';
+const CACHE = 'lineal-v3';
 const FILES = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-512-maskable.png'];
 
 self.addEventListener('install', e => {
